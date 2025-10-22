@@ -1,0 +1,65 @@
+import pandas as pd
+import numpy as np
+
+car_df = pd.read_csv("CAR DETAILS FROM CAR DEKHO.csv")
+car_df.head(5)
+
+null_values = car_df.isnull().sum()
+print(null_values)
+#one hot encoding fuel	seller_type	transmission	owner
+a = car_df['fuel'].value_counts()
+b = car_df['seller_type'].value_counts()
+d = car_df['owner'].value_counts()
+print(a)
+print()
+print(b)
+print()
+print(d)
+from sklearn.preprocessing import OneHotEncoder
+encoder = OneHotEncoder(drop = 'first',sparse_output=False)
+fit = encoder.fit_transform(car_df[['fuel','seller_type','transmission','owner']])
+encoded_cols = encoder.get_feature_names_out(['fuel','seller_type','transmission','owner'])
+encoded_df = pd.DataFrame(fit, columns=encoded_cols)
+final_df = pd.concat([car_df.drop(['fuel','seller_type','transmission','owner','name'], axis=1), encoded_df], axis=1)
+print(final_df.head())
+#split the data
+from sklearn.model_selection import train_test_split
+
+X = final_df.drop(['selling_price'],axis=1)
+y = final_df['selling_price']
+X_train,X_test,y_train,y_test = train_test_split(X,y,test_size=0.2,random_state=42)
+print("X_train shape:", X_train.shape)
+print("X_test shape:", X_test.shape)
+print("y_train shape:", y_train.shape)
+print("y_test shape:", y_test.shape)
+#standard scaler
+from sklearn.preprocessing import StandardScaler
+
+scaler = StandardScaler()
+numeric_cols = ['year', 'km_driven']
+X_train[numeric_cols] = scaler.fit_transform(X_train[numeric_cols])
+X_test[numeric_cols] = scaler.transform(X_test[numeric_cols])
+print(X_train.describe())
+
+#fit the model
+
+
+from sklearn.linear_model import LinearRegression
+model = LinearRegression()
+model.fit(X_train, y_train)
+
+
+y_pred = model.predict(X_test)
+
+
+
+from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
+import numpy as np
+
+r2 = r2_score(y_test, y_pred)
+mae = mean_absolute_error(y_test, y_pred)
+rmse = np.sqrt(mean_squared_error(y_test, y_pred))
+
+print("R² Score:", r2)
+
+
