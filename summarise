@@ -1,0 +1,318 @@
+import pdfplumber
+import fitz
+import os
+import time
+from pathlib import Path
+from typing import List, Dict, Tuple
+import subprocess
+import sys
+from datetime import datetime
+import logging
+
+
+
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
+
+
+
+class PDFExtractor:
+    """Extract text from encrypted PDFs"""
+    
+    @staticmethod
+    def extract(pdf_path: str) -> Tuple[str, int]:
+        """Extract text from PDF"""
+        try:
+            with pdfplumber.open(pdf_path) as pdf:
+                page_count = len(pdf.pages)
+                full_text = ""
+                success_pages = 0
+                
+                for page_num, page in enumerate(pdf.pages):
+                    try:
+                        # Extract text
+                        text = page.extract_text()
+                        
+                        if text and len(text.strip()) > 5:
+                            full_text += text + "\n\n"
+                            success_pages += 1
+                        else:
+                            # Try table extraction
+                            tables = page.extract_tables()
+                            if tables:
+                                for table in tables:
+                                    for row in table:
+                                        row_text = " ".join([str(cell) if cell else "" for cell in row])
+                                        full_text += row_text + "\n"
+                                success_pages += 1
+                    except:
+                        continue
+                
+                logger.info(f"  Extracted: {success_pages}/{page_count} pages, {len(full_text)} chars")
+                
+                return full_text, page_count
+        
+        except Exception as e:
+            logger.error(f"  Extraction error: {e}")
+            return "", 0
+
+
+
+class Summarizer:
+    """Create summaries using Ollama"""
+    
+    @staticmethod
+    def check_ollama():
+        """Check if Ollama is running"""
+        try:
+            result = subprocess.run(
+                ["ollama", "list"],
+                capture_output=True,
+                text=True,
+                timeout=3
+            )
+            return result.returncode == 0
+        except:
+            return False
+    
+    @staticmethod
+    def summarize(text: str, page_count: int) -> str:
+        """Create summary"""
+        
+        # Determine target length
+        if page_count <= 5:
+            word_target = 100
+        elif page_count <= 20:
+            word_target = 150
+        else:
+            word_target = 200
+        
+        # Use first 10000 chars
+        content = text[:10000]
+        
+        # Professional prompt for batch analysis documents
+        prompt = f"""You are an expert document summarizer for laboratory and chemical analysis reports.
+
+
+
+DOCUMENT CONTENT:
+{content}
+
+
+
+Please create a professional summary of approximately {word_target} words.
+
+
+
+Include:
+1. Document type and purpose
+2. Main samples or subjects analyzed
+3. Key testing methods used
+4. Major findings and results
+5. Quality/compliance status
+6. Any important conclusions or recommendations
+
+
+
+Write in professional, clear language suitable for business use.
+
+
+
+SUMMARY ({word_target} words):"""
+        
+        logger.info(f"  Summarizing ({word_target} words)...")
+        
+        start = time.time()
+        
+        try:
+            result = subprocess.run(
+                ["ollama", "run", "neural-chat", prompt],
+                capture_output=True,
+                text=True,
+                encoding='utf-8',
+                errors='ignore',
+                timeout=120
+            )
+            
+            elapsed = time.time() - start
+            
+            if result.returncode == 0:
+                summary = result.stdout.strip()
+                word_count = len(summary.split())
+                logger.info(f"  Generated: {word_count} words in {elapsed:.1f}s")
+                return summary
+            else:
+                logger.error(f"  Summarization failed")
+                return "[Summarization failed]"
+        
+        except subprocess.TimeoutExpired:
+            logger.error(f"  Timeout")
+            return "[Timeout]"
+        except Exception as e:
+            logger.error(f"  Error: {e}")
+            return "[Error]"
+
+
+
+class OutputCreator:
+    """Create output PDF"""
+    
+    @staticmethod
+    def create_pdf(results: List[Dict], output_name: str):
+        """Create output PDF - SIMPLE AND WORKING"""
+        
+        logger.info("Creating output PDF...")
+        
+        doc = fitz.open()
+        
+        # COMBINE ALL SUMMARIES
+        all_text = ""
+        for result in results:
+            all_text += f"{result['summary']}\n\n"
+        
+        if not all_text.strip():
+            logger.error("No summaries to write!")
+            doc.close()
+            return
+        
+        # Simple approach: split text into chunks and add to pages
+        lines = all_text.split('\n')
+        current_text = ""
+        
+        for line in lines:
+            current_text += line + "\n"
+            
+            # Rough estimate: ~50 lines per page
+            if len(current_text.split('\n')) > 50:
+                page = doc.new_page()
+                rect = page.rect
+                rect.x0 += 30
+                rect.y0 += 30
+                rect.x1 -= 30
+                rect.y1 -= 30
+                
+                try:
+                    page.insert_textbox(rect, current_text, fontsize=10, fontname="helv")
+                except:
+                    page.insert_text((50, 50), current_text, fontsize=10, fontname="helv")
+                
+                current_text = ""
+        
+        # Add remaining text to last page
+        if current_text.strip():
+            page = doc.new_page()
+            rect = page.rect
+            rect.x0 += 30
+            rect.y0 += 30
+            rect.x1 -= 30
+            rect.y1 -= 30
+            
+            try:
+                page.insert_textbox(rect, current_text, fontsize=10, fontname="helv")
+            except:
+                page.insert_text((50, 50), current_text, fontsize=10, fontname="helv")
+        
+        doc.save(output_name)
+        doc.close()
+        
+        logger.info(f"PDF saved: {output_name}")
+
+
+
+def main():
+    """Main execution"""
+    
+    # START TOTAL TIMER
+    total_start = time.time()
+    
+    logger.info("\n" + "="*70)
+    logger.info("PDF SUMMARIZER - COMPLETE SOLUTION")
+    logger.info("="*70)
+    
+    # Check Ollama
+    logger.info("\nChecking Ollama...")
+    if not Summarizer.check_ollama():
+        logger.error("ERROR: Ollama not running!")
+        logger.info("Start Ollama: ollama serve (in another terminal)")
+        sys.exit(1)
+    logger.info("✓ Ollama ready")
+    
+    # Find PDFs - EXCLUDE OUTPUT FILES
+    all_pdfs = list(Path(".").glob("*.pdf"))
+    # Filter out output files
+    pdf_files = sorted([f for f in all_pdfs if f.name not in ["final_summary.pdf", "final_summary_gpu.pdf"]])
+    
+    if not pdf_files:
+        logger.error("ERROR: No PDF files found!")
+        sys.exit(1)
+    
+    logger.info(f"Found {len(pdf_files)} PDFs")
+    logger.info("\n" + "="*70)
+    logger.info("PROCESSING")
+    logger.info("="*70)
+    
+    results = []
+    
+    for i, pdf_file in enumerate(pdf_files, 1):
+        pdf_path = str(pdf_file)
+        
+        logger.info(f"\n[{i}/{len(pdf_files)}] {pdf_file.name}")
+        logger.info("─"*70)
+        
+        start = time.time()
+        
+        # Extract
+        logger.info("Extracting text...")
+        text, page_count = PDFExtractor.extract(pdf_path)
+        
+        if not text or len(text) < 100:
+            logger.error("Not enough text extracted, skipping")
+            results.append({
+                "filename": pdf_file.name,
+                "pages": page_count,
+                "summary": "[Insufficient text]",
+                "time": 0
+            })
+            continue
+        
+        # Summarize
+        logger.info("Creating summary...")
+        summary = Summarizer.summarize(text, page_count)
+        
+        elapsed = time.time() - start
+        
+        results.append({
+            "filename": pdf_file.name,
+            "pages": page_count,
+            "summary": summary,
+            "time": elapsed
+        })
+        
+        logger.info(f"✓ Completed in {elapsed:.1f}s")
+    
+    # Create output
+    if results:
+        logger.info("\n" + "="*70)
+        OutputCreator.create_pdf(results, "final_summary.pdf")
+        logger.info("="*70)
+        
+        # CALCULATE TOTAL EXECUTION TIME
+        total_elapsed = time.time() - total_start
+        
+        logger.info("✓ ALL COMPLETE!")
+        logger.info(f"Output file: final_summary.pdf")
+        logger.info(f"\nExecution Time:")
+        logger.info(f"  Total: {total_elapsed:.2f} seconds ({total_elapsed/60:.2f} minutes)")
+        logger.info(f"  PDFs Processed: {len(pdf_files)}")
+        logger.info(f"  Average Time per PDF: {total_elapsed/len(pdf_files):.2f} seconds")
+        logger.info("="*70 + "\n")
+    else:
+        logger.error("No PDFs processed successfully!")
+
+
+
+if __name__ == "__main__":
+    main()
