@@ -1,0 +1,265 @@
+import pdfplumber
+import fitz
+import subprocess
+import time
+import logging
+
+logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(message)s')
+logger = logging.getLogger(__name__)
+
+
+class SecondLevelSummarizer:
+    """Create a second-level summary from the final_summary.pdf"""
+    
+    @staticmethod
+    def extract_text_from_pdf(pdf_path: str) -> str:
+        """Extract all text from PDF"""
+        logger.info(f"Extracting text from {pdf_path}...")
+        try:
+            full_text = ""
+            with pdfplumber.open(pdf_path) as pdf:
+                logger.info(f"  Total pages: {len(pdf.pages)}")
+                for page_num, page in enumerate(pdf.pages):
+                    try:
+                        text = page.extract_text()
+                        if text:
+                            full_text += text + "\n\n"
+                    except:
+                        continue
+            
+            logger.info(f"  Extracted: {len(full_text)} characters")
+            return full_text
+        except Exception as e:
+            logger.error(f"  Extraction error: {e}")
+            return ""
+    
+    @staticmethod
+    def create_second_level_summary(pdf_text: str) -> str:
+        """Create second-level summary using custom prompt"""
+        logger.info("Creating second-level summary...")
+        
+        # Limit text to avoid timeout
+        content = pdf_text[:15000]  # First 15000 chars
+        
+        prompt = f'''You are an expert technical summarizer. A combined “final.pdf” document has already been created by merging and summarizing multiple PDFs. Your task is to create a second-level summary that is substantially more detailed and expanded.
+
+=== SUMMARY REQUIREMENTS ===
+- Produce a smooth, continuous narrative with no headings, no bullets, no numbering.
+- Expand the content so the final summary is approximately four times longer than the input, adding clarification and fuller explanations while keeping meaning consistent and not inventing new facts.
+- DO NOT break any words across lines.
+- Format the output into lines with a maximum of 80 characters per line to prevent word-break issues during PDF generation.
+- Maintain a professional, technical tone suitable for pharmaceutical documents.
+- Keep the content logically structured, flowing, and coherent.
+- Ignore missing information; do NOT mention anything is absent or not discussed.
+- Output ONLY the final formatted summary, nothing else.
+
+=== INPUT DOCUMENT ===
+{content}
+
+=== YOUR TASK ===
+Rewrite the above text into a single expanded narrative that is around four times longer, more descriptive, and more detailed, while preserving the original meaning. Use multiple short lines, each limited to 80 characters, and never break any words.
+
+
+'''
+        
+        logger.info("Sending to Ollama...")
+        start = time.time()
+        
+        try:
+            result = subprocess.run(
+                ["ollama", "run", "neural-chat", prompt],
+                capture_output=True,
+                text=True,
+                encoding='utf-8',
+                errors='ignore',
+                timeout=180  # Longer timeout for larger summary
+            )
+            elapsed = time.time() - start
+            
+            if result.returncode == 0:
+                summary = result.stdout.strip()
+                logger.info(f"  Generated: {len(summary)} characters in {elapsed:.1f}s")
+                return summary
+            else:
+                logger.error(f"  Summarization failed: {result.stderr}")
+                return ""
+        except subprocess.TimeoutExpired:
+            logger.error(f"  Timeout after {elapsed:.1f}s")
+            return ""
+        except Exception as e:
+            logger.error(f"  Error: {e}")
+            return ""
+    
+    @staticmethod
+    def save_summary_to_pdf(summary_text: str, output_name: str):
+        """Save second-level summary to PDF with minimal spacing"""
+        logger.info("Creating second-level PDF...")
+        
+        if not summary_text.strip():
+            logger.error("No summary text to save!")
+            return
+        
+        # Remove extra blank lines (minimal spacing as requested)
+        lines = summary_text.split('\n')
+        cleaned_lines = []
+        prev_empty = False
+        
+        for line in lines:
+            is_empty = len(line.strip()) == 0
+            
+            # Skip multiple consecutive empty lines
+            if is_empty:
+                if not prev_empty:
+                    cleaned_lines.append('')  # Keep only one empty line
+                prev_empty = True
+            else:
+                cleaned_lines.append(line)
+                prev_empty = False
+        
+        all_text = '\n'.join(cleaned_lines)
+        
+        logger.info(f"  Final text size: {len(all_text)} characters")
+        
+        doc = fitz.open()
+        
+        # Line-by-line insertion
+        lines_to_write = all_text.split('\n')
+        logger.info(f"  Total lines: {len(lines_to_write)}")
+        
+        page = None
+        y_position = 50
+        line_height = 11  # Slightly smaller for condensed format
+        page_width = 595
+        page_height = 842
+        margin_left = 40
+        margin_top = 50
+        margin_bottom = 50
+        max_y = page_height - margin_bottom
+        
+        page_num = 0
+        
+        for line_idx, line in enumerate(lines_to_write):
+            # Create new page if needed
+            if page is None or y_position > max_y:
+                if page is not None:
+                    page_num += 1
+                    logger.info(f"  Page {page_num} completed")
+                
+                page = doc.new_page(width=page_width, height=page_height)
+                y_position = margin_top
+                page_num += 1
+            
+            # Insert line
+            try:
+                max_chars = 100
+                if len(line) > max_chars:
+                    wrapped = [line[i:i+max_chars] for i in range(0, len(line), max_chars)]
+                    for wrapped_line in wrapped:
+                        if y_position > max_y:
+                            page = doc.new_page(width=page_width, height=page_height)
+                            y_position = margin_top
+                            page_num += 1
+                        
+                        page.insert_text(
+                            (margin_left, y_position),
+                            wrapped_line,
+                            fontsize=9,
+                            fontname="helv",
+                            color=(0, 0, 0)
+                        )
+                        y_position += line_height
+                else:
+                    page.insert_text(
+                        (margin_left, y_position),
+                        line,
+                        fontsize=9,
+                        fontname="helv",
+                        color=(0, 0, 0)
+                    )
+                    y_position += line_height
+                
+                if (line_idx + 1) % 100 == 0:
+                    logger.info(f"  Processed {line_idx + 1}/{len(lines_to_write)} lines")
+                    
+            except Exception as e:
+                logger.error(f"  Line {line_idx} error: {e}")
+                y_position += line_height
+                continue
+        
+        logger.info(f"  Page {page_num} completed (final)")
+        
+        doc.save(output_name)
+        doc.close()
+        
+        logger.info(f"✓ PDF saved: {output_name}")
+        logger.info(f"  Total pages: {page_num}")
+
+
+def create_second_level_summary_pdf():
+    """Main function to create second-level summary PDF"""
+    logger.info("\n" + "="*70)
+    logger.info("SECOND-LEVEL SUMMARY GENERATOR")
+    logger.info("="*70)
+    
+    # Check if final_summary.pdf exists
+    import os
+    if not os.path.exists("final_summary.pdf"):
+        logger.error("ERROR: final_summary.pdf not found!")
+        logger.info("Please run the main summarizer first to create final_summary.pdf")
+        return False
+    
+    logger.info("✓ final_summary.pdf found")
+    
+    # Check Ollama
+    logger.info("\nChecking Ollama...")
+    try:
+        result = subprocess.run(["ollama", "list"], capture_output=True, text=True, timeout=3)
+        if result.returncode != 0:
+            logger.error("ERROR: Ollama not running!")
+            logger.info("Start Ollama: ollama serve (in another terminal)")
+            return False
+    except:
+        logger.error("ERROR: Ollama not running!")
+        logger.info("Start Ollama: ollama serve (in another terminal)")
+        return False
+    
+    logger.info("✓ Ollama ready")
+    
+    # Step 1: Extract text from final_summary.pdf
+    logger.info("\n" + "="*70)
+    logger.info("STEP 1: EXTRACTING TEXT FROM final_summary.pdf")
+    logger.info("="*70)
+    pdf_text = SecondLevelSummarizer.extract_text_from_pdf("final_summary.pdf")
+    
+    if not pdf_text or len(pdf_text) < 100:
+        logger.error("ERROR: Could not extract enough text from final_summary.pdf")
+        return False
+    
+    # Step 2: Create second-level summary
+    logger.info("\n" + "="*70)
+    logger.info("STEP 2: CREATING SECOND-LEVEL SUMMARY")
+    logger.info("="*70)
+    second_summary = SecondLevelSummarizer.create_second_level_summary(pdf_text)
+    
+    if not second_summary:
+        logger.error("ERROR: Could not generate second-level summary")
+        return False
+    
+    # Step 3: Save to PDF
+    logger.info("\n" + "="*70)
+    logger.info("STEP 3: SAVING TO final_pdf2.pdf")
+    logger.info("="*70)
+    SecondLevelSummarizer.save_summary_to_pdf(second_summary, "final_pdf2.pdf")
+    
+    logger.info("\n" + "="*70)
+    logger.info("✓ ALL COMPLETE!")
+    logger.info("Output files:")
+    logger.info("  - final_summary.pdf (original summary of all PDFs)")
+    logger.info("  - final_pdf2.pdf (condensed second-level summary)")
+    logger.info("="*70 + "\n")
+    
+    return True
+
+
+if __name__ == "__main__":
+    create_second_level_summary_pdf()
